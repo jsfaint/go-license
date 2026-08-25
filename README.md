@@ -34,8 +34,7 @@ The tool will automatically detect each file's type and process accordingly.
 ## Output 输出内容
 
 ### Summary Excel report (license_report.xlsx):
-所有选中文件的依赖汇总在一张表中，每行一个依赖，列结构统一：
-- **Source File** - 来源文件（go.mod / package.json / pyproject.toml）
+所有选中文件的直接依赖汇总在一张表中（go.mod 中 `// indirect` 的依赖不包含），列结构统一：
 - **Name** - 包名称
 - **Version** - 版本
 - **License** - 许可证类型
@@ -49,7 +48,8 @@ The tool will automatically detect each file's type and process accordingly.
 
 ### CycloneDX SBOM (sbom.json):
 每次运行都会生成一份 `sbom.json`（CycloneDX 1.6 JSON），覆盖所有选中 manifest 文件的
-直接依赖（范围符合 CRA Annex I Part II 的底线；间接依赖需 lockfile 解析，列为后续增强）。
+直接依赖（范围符合 CRA Annex I Part II 的底线；go.mod 的 `// indirect` 依赖不包含，
+其余生态的间接依赖需 lockfile 解析，列为后续增强）。
 - **metadata.component** - 项目本体（type=application）
 - **Components** - 每个直接依赖一个组件（type=library），含 Name、Version、PURL
   （`pkg:golang/...`、`pkg:npm/...`、`pkg:pypi/...`）、SPDX License ID + URL、Description、Author

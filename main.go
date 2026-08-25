@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -203,6 +204,11 @@ func parseGoMod(filename string) ([]Package, string, error) {
 
 	var packages []Package
 	for _, req := range file.Require {
+		// Direct dependencies only; // indirect entries are resolved by the
+		// build toolchain and are not part of the report.
+		if req.Indirect {
+			continue
+		}
 		packages = append(packages, Package{
 			Path:    req.Mod.Path,
 			Version: req.Mod.Version,
@@ -933,42 +939,77 @@ func main() {
 	for _, pf := range parsed {
 		total += len(pf.packages)
 	}
-	processed := 0
 
-	// Fetch metadata for every package; collect rows for the single summary
-	// Excel report and per-module lists for the merged SBOM
-	type excelRow struct {
-		sourceFile string
-		info       PackageInfo
+	// Fetch metadata for every package concurrently. Registry lookups are
+	// network-bound; a small worker pool (8) keeps total runtime down while
+	// staying well under rate limits. Results are written to an
+	// index-addressed grid so the output order matches the serial behaviour.
+	const concurrency = 8
+
+	type job struct {
+		fi  int // parsed-file index
+		idx int // package index within that file
+		pf  parsedFile
+		pkg Package
 	}
-	var rows []excelRow
-	var modules []moduleResult
-	excluded := 0
-	for _, pf := range parsed {
-		infos := make([]PackageInfo, 0, len(pf.packages))
-		for _, pkg := range pf.packages {
+	jobs := make([]job, 0, total)
+	for fi, pf := range parsed {
+		for pi, pkg := range pf.packages {
+			jobs = append(jobs, job{fi: fi, idx: pi, pf: pf, pkg: pkg})
+		}
+	}
+
+	results := make([][]PackageInfo, len(parsed))
+	for fi, pf := range parsed {
+		results[fi] = make([]PackageInfo, len(pf.packages))
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	var mu sync.Mutex // serializes progress updates (zenity calls)
+	processed := 0
+	for _, j := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j job) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			var info PackageInfo
+			if j.pf.isGoMod {
+				info = getGoModMetadata(&j.pkg)
+			} else if j.pf.isPyProject {
+				info = getPyPI_Metadata(&j.pkg)
+			} else {
+				info = getNPMMetadata(&j.pkg)
+			}
+			results[j.fi][j.idx] = info
+
+			mu.Lock()
+			processed++
 			if total > 0 {
 				dlg.Value(int(float64(processed) / float64(total) * 100))
 			}
-			dlg.Text("Processing " + pkg.Path + "...")
-			processed++
+			dlg.Text("Processing " + j.pkg.Path + "...")
+			mu.Unlock()
+		}(j)
+	}
+	wg.Wait()
 
-			var info PackageInfo
-			if pf.isGoMod {
-				info = getGoModMetadata(&pkg)
-			} else if pf.isPyProject {
-				info = getPyPI_Metadata(&pkg)
-			} else {
-				info = getNPMMetadata(&pkg)
-			}
-			// Internal/unresolvable packages (registry 404) are dropped
-			// from both the Excel report and the SBOM.
+	// Collect in manifest order; internal/unresolvable packages (registry
+	// 404) are dropped from both the Excel report and the SBOM.
+	var rows []PackageInfo
+	var modules []moduleResult
+	excluded := 0
+	for fi, pf := range parsed {
+		infos := make([]PackageInfo, 0, len(pf.packages))
+		for _, info := range results[fi] {
 			if info.Internal {
 				excluded++
 				continue
 			}
 			infos = append(infos, info)
-			rows = append(rows, excelRow{sourceFile: filepath.Base(pf.inName), info: info})
+			rows = append(rows, info)
 		}
 		modules = append(modules, moduleResult{moduleName: pf.moduleName, infos: infos})
 	}
@@ -976,24 +1017,23 @@ func main() {
 	// Single summary Excel report covering every selected manifest file
 	f := excelize.NewFile()
 	sheetName := f.GetSheetName(0)
-	header := []string{"Source File", "Name", "Version", "License", "License URL", "Author", "Description", "Copyright", "Repository", "GitHub URL", "Repository Type"}
+	header := []string{"Name", "Version", "License", "License URL", "Author", "Description", "Copyright", "Repository", "GitHub URL", "Repository Type"}
 	for i, col := range header {
 		cell := fmt.Sprintf("%s1", string(rune('A'+i)))
 		f.SetCellValue(sheetName, cell, col)
 	}
 	for i, r := range rows {
 		row := []interface{}{
-			r.sourceFile,
-			r.info.Name,
-			r.info.Version,
-			r.info.License,
-			r.info.LicenseURL,
-			r.info.Author,
-			r.info.Description,
-			r.info.Copyright,
-			r.info.Repository,
-			r.info.GitHubURL,
-			r.info.RepositoryType,
+			r.Name,
+			r.Version,
+			r.License,
+			r.LicenseURL,
+			r.Author,
+			r.Description,
+			r.Copyright,
+			r.Repository,
+			r.GitHubURL,
+			r.RepositoryType,
 		}
 		for j, val := range row {
 			cell := fmt.Sprintf("%s%d", string(rune('A'+j)), i+2)
