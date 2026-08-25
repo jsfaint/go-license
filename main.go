@@ -900,30 +900,17 @@ func main() {
 	}
 	processed := 0
 
+	// Fetch metadata for every package; collect rows for the single summary
+	// Excel report and per-module lists for the merged SBOM
+	type excelRow struct {
+		sourceFile string
+		info       PackageInfo
+	}
+	var rows []excelRow
 	var modules []moduleResult
 	for _, pf := range parsed {
-		// Create Excel workbook
-		f := excelize.NewFile()
-		sheetName := f.GetSheetName(0)
-
-		// Write header based on file type
-		header := []string{}
-		if pf.isGoMod {
-			header = []string{"Name", "License", "PackageVersion", "LicenseURL", "Author", "Description", "Copyright", "PackageURL", "GitHubURL", "RepositoryType"}
-		} else if pf.isPyProject {
-			header = []string{"Package Name", "License", "Version", "License URL", "Author", "Description", "Copyright", "Repository", "GitHub URL", "Repository Type"}
-		} else {
-			header = []string{"Module Name", "License", "Repository", "License URL", "Author", "Description", "Copyright", "GitHub URL", "Module Name (No Version)", "Version"}
-		}
-
-		// Write header row
-		for i, col := range header {
-			cell := fmt.Sprintf("%s1", string(rune('A'+i)))
-			f.SetCellValue(sheetName, cell, col)
-		}
-
 		infos := make([]PackageInfo, 0, len(pf.packages))
-		for i, pkg := range pf.packages {
+		for _, pkg := range pf.packages {
 			if total > 0 {
 				dlg.Value(int(float64(processed) / float64(total) * 100))
 			}
@@ -933,68 +920,47 @@ func main() {
 			var info PackageInfo
 			if pf.isGoMod {
 				info = getGoModMetadata(&pkg)
-				row := []interface{}{
-					info.Name,
-					info.License,
-					info.Version,
-					info.LicenseURL,
-					info.Author,
-					info.Description,
-					info.Copyright,
-					info.PackageURL,
-					info.GitHubURL,
-					info.RepositoryType,
-				}
-				for j, val := range row {
-					cell := fmt.Sprintf("%s%d", string(rune('A'+j)), i+2)
-					f.SetCellValue(sheetName, cell, val)
-				}
 			} else if pf.isPyProject {
 				info = getPyPI_Metadata(&pkg)
-				row := []interface{}{
-					info.Name,
-					info.License,
-					info.Version,
-					info.LicenseURL,
-					info.Author,
-					info.Description,
-					info.Copyright,
-					info.Repository,
-					info.GitHubURL,
-					info.RepositoryType,
-				}
-				for j, val := range row {
-					cell := fmt.Sprintf("%s%d", string(rune('A'+j)), i+2)
-					f.SetCellValue(sheetName, cell, val)
-				}
 			} else {
 				info = getNPMMetadata(&pkg)
-				row := []interface{}{
-					info.Name + "@" + info.Version,
-					info.License,
-					info.Repository,
-					info.LicenseURL,
-					info.Author,
-					info.Description,
-					info.Copyright,
-					info.GitHubURL,
-					info.ModuleNameNoVer,
-					info.Version,
-				}
-				for j, val := range row {
-					cell := fmt.Sprintf("%s%d", string(rune('A'+j)), i+2)
-					f.SetCellValue(sheetName, cell, val)
-				}
 			}
 			infos = append(infos, info)
-		}
-
-		outName := pf.moduleName + "_license.xlsx"
-		if err := f.SaveAs(outName); err != nil {
-			zenity.Error("Failed to save Excel file: "+err.Error(), zenity.Title("Error"), zenity.ErrorIcon)
-			return
+			rows = append(rows, excelRow{sourceFile: filepath.Base(pf.inName), info: info})
 		}
 		modules = append(modules, moduleResult{moduleName: pf.moduleName, infos: infos})
+	}
+
+	// Single summary Excel report covering every selected manifest file
+	f := excelize.NewFile()
+	sheetName := f.GetSheetName(0)
+	header := []string{"Source File", "Name", "Version", "License", "License URL", "Author", "Description", "Copyright", "Repository", "GitHub URL", "Repository Type"}
+	for i, col := range header {
+		cell := fmt.Sprintf("%s1", string(rune('A'+i)))
+		f.SetCellValue(sheetName, cell, col)
+	}
+	for i, r := range rows {
+		row := []interface{}{
+			r.sourceFile,
+			r.info.Name,
+			r.info.Version,
+			r.info.License,
+			r.info.LicenseURL,
+			r.info.Author,
+			r.info.Description,
+			r.info.Copyright,
+			r.info.Repository,
+			r.info.GitHubURL,
+			r.info.RepositoryType,
+		}
+		for j, val := range row {
+			cell := fmt.Sprintf("%s%d", string(rune('A'+j)), i+2)
+			f.SetCellValue(sheetName, cell, val)
+		}
+	}
+	if err := f.SaveAs("license_report.xlsx"); err != nil {
+		zenity.Error("Failed to save Excel file: "+err.Error(), zenity.Title("Error"), zenity.ErrorIcon)
+		return
 	}
 
 	// Assemble the merged CycloneDX SBOM covering all selected manifests
@@ -1013,5 +979,5 @@ func main() {
 	}
 
 	dlg.Complete()
-	zenity.Info("License reports generated. SBOM: sbom.json", zenity.Title("Success"), zenity.InfoIcon)
+	zenity.Info("License report: license_report.xlsx. SBOM: sbom.json", zenity.Title("Success"), zenity.InfoIcon)
 }
