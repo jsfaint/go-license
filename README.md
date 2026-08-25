@@ -1,121 +1,128 @@
-# go-license
+# license_fetcher
 
-A GUI-based license analysis tool for Go, Node.js, and Python projects
+一个桌面 GUI 工具：解析 Go / Node.js / Python 项目的依赖清单，从公开 registry 抓取许可证等元数据，汇总生成 Excel 报告和 CycloneDX SBOM。
 
-一个基于GUI的Go、Node.js和Python项目许可证分析工具
+A GUI tool that parses dependency manifests of Go / Node.js / Python projects, fetches license metadata from public registries, and produces an Excel report plus a CycloneDX SBOM.
 
-## Features 功能特性
+## 功能特性
 
-- **Multi-language Support** 多语言支持：支持解析 Go 模块 (go.mod)、Node.js 项目 (package.json) 和 Python 项目 (pyproject.toml)
-- **Multi-source Metadata** 多源元数据：从 pkg.go.dev v1 API、npm registry 和 PyPI 获取许可证信息
-- **Rich Information** 丰富信息：提取许可证、作者、描述、版权、仓库链接等详细信息
-- **Multi-file Selection** 多文件选择：可同时选择多个 manifest 文件，汇总成一份报告
-- **CycloneDX SBOM** SBOM生成：将所有选中文件的直接依赖合并生成一份 CycloneDX 1.6 JSON SBOM（`sbom.json`，按 PURL 去重）
-- **Excel Export** Excel导出：所有文件的依赖汇总成一份 `license_report.xlsx`，列结构统一，便于查看和管理
-- **GUI Interface** 图形界面：使用文件选择对话框，用户友好
-- **Progress Tracking** 进度跟踪：实时显示处理进度
+- **多语言支持**：解析 `go.mod`、`package.json`、`pyproject.toml`（Poetry 与 PEP 621 两种风格）
+- **多源元数据**：从 pkg.go.dev v1 API、npm registry 和 PyPI 查询许可证、作者、描述、版权、仓库链接
+- **多文件汇总**：一次可选多个清单文件，合并成一份报告和一份 SBOM
+- **CycloneDX SBOM**：1.6 JSON 格式，按 PURL 去重，覆盖 CRA Annex I Part II 要求的直接依赖范围
+- **并发抓取**：8 个 worker 并发查询 registry，输出顺序仍与清单一致
+- **全程 GUI**：文件选择、进度跟踪、结果提示均为图形对话框
 
-## Usage 使用方法
+## 使用方法
 
-1. Run the program:
 ```bash
-go run main.go
+go run main.go   # 或 task run
 ```
 
-2. 选择文件（可多选）：
-   - 对于 Go 项目，选择 `go.mod` 文件
-   - 对于 Node.js 项目，选择 `package.json` 文件
-   - 对于 Python 项目，选择 `pyproject.toml` 文件
+在文件对话框中选择一个或多个清单文件（可跨项目混选），工具按文件名后缀自动识别类型：
 
-The tool will automatically detect each file's type and process accordingly.
-工具会自动检测每个文件的类型并进行相应处理。所有文件的依赖会汇总成一份 Excel 报告
-`license_report.xlsx` 和一份 `sbom.json`（CycloneDX 1.6，按 PURL 去重）。
+| 文件 | 项目类型 | 解析范围 |
+| --- | --- | --- |
+| `go.mod` | Go | 直接依赖（`// indirect` 不包含） |
+| `package.json` | Node.js | `dependencies` + `devDependencies` |
+| `pyproject.toml` | Python | Poetry `dependencies` / `dev-dependencies`，或 PEP 621 `project.dependencies` |
 
-## Output 输出内容
+运行结束后在当前工作目录生成两个文件：
 
-### Summary Excel report (license_report.xlsx):
-所有选中文件的直接依赖汇总在一张表中（go.mod 中 `// indirect` 的依赖不包含），列结构统一：
-- **Name** - 包名称
-- **Version** - 版本
-- **License** - 许可证类型
-- **License URL** - 许可证URL
-- **Author** - 作者
-- **Description** - 描述
-- **Copyright** - 版权信息
-- **Repository** - 仓库地址
-- **GitHub URL** - GitHub链接
-- **Repository Type** - 仓库类型（go / npm / pypi）
+- `sbom_report.xlsx` —— 所有选中文件的依赖汇总表
+- `sbom.json` —— 合并后的 CycloneDX SBOM
 
-### CycloneDX SBOM (sbom.json):
-每次运行都会生成一份 `sbom.json`（CycloneDX 1.6 JSON），覆盖所有选中 manifest 文件的
-直接依赖（范围符合 CRA Annex I Part II 的底线；go.mod 的 `// indirect` 依赖不包含，
-其余生态的间接依赖需 lockfile 解析，列为后续增强）。
-- **metadata.component** - 项目本体（type=application）
-- **Components** - 每个直接依赖一个组件（type=library），含 Name、Version、PURL
-  （`pkg:golang/...`、`pkg:npm/...`、`pkg:pypi/...`）、SPDX License ID + URL、Description、Author
+## 输出说明
+
+### Excel 汇总报告（sbom_report.xlsx）
+
+所有选中文件的依赖合并在一张表中，列结构统一：
+
+| 列 | 说明 |
+| --- | --- |
+| Name | 包名称 |
+| Version | 版本（见下方「版本解析」） |
+| License | 许可证类型 |
+| License URL | SPDX 许可证链接 |
+| Author | 作者 |
+| Description | 描述 |
+| Copyright | 版权信息 |
+| Repository | 仓库地址 |
+| GitHub URL | GitHub 链接 |
+| Repository Type | 来源生态（go / npm / pypi） |
+
+### CycloneDX SBOM（sbom.json）
+
+- **metadata.component** —— 项目本体（type=application），名称由所有清单模块名以 `+` 连接
+- **components** —— 每个直接依赖一个组件（type=library），含 Name、Version、PURL（`pkg:golang/…`、`pkg:npm/…`、`pkg:pypi/…`）、SPDX 许可证 ID + URL、描述、作者、版权
 - 跨文件重复依赖按 PURL 去重，`dependencies` 字段留空
+- 间接依赖需 lockfile 才能解析，列为后续增强
 
-### Internal packages 内部包过滤:
-在公开 registry（pkg.go.dev / registry.npmjs.org / pypi.org）上查询不到（404）的依赖，
-视为内部库或不可解析名称，**不会出现在 Excel 报告和 SBOM 中**。运行结束时提示被排除的数量。
-网络错误、超时等不判定为内部库。
+### 内部包过滤
 
-## Requirements 环境要求
+在公开 registry 上查询返回 404 的依赖视为内部库或不可解析名称，不会出现在报告和 SBOM 中，运行结束时提示排除的数量。网络错误、超时不判定为内部包。
 
-- Go 1.25.0 or higher / Go 1.25.0 或更高版本
+### 版本解析
 
-## Installation 安装步骤
+清单中的非精确约束（`^1.2.3`、`~1.2.3`、`*`、`latest`、空）解析为 registry 实际提供的版本；精确 pin（`==x.y.z` 或裸版本号）保持不变。Go 模块采用 API 返回的实际版本。
+
+### 许可证处理
+
+- PyPI 许可证优先取 classifiers，并标准化为 SPDX ID（如 "MIT License" → `MIT`）
+- 许可证 URL 统一为 `https://spdx.org/licenses/{SPDX_ID}.html`；无法映射到稳定引用的标识留空
+- Go 模块优先从许可证文本中提取版权行作为 Copyright
+
+## 构建与安装
+
+环境要求：Go 1.25.0+
 
 ```bash
-git clone <repository-url>
-cd go-license
-go mod tidy
-go run main.go
+git clone https://github.com/jsfaint/license_fetcher.git
+cd license_fetcher
 ```
 
-## Build Binary 构建可执行文件
+开发运行：
 
 ```bash
-go build -o go-license.exe main.go
+task run    # 或 go run main.go
 ```
 
-## Dependencies 依赖库
+构建 Windows GUI 可执行文件（无控制台窗口）：
 
-- **[cyclonedx-go](https://github.com/CycloneDX/cyclonedx-go)** - CycloneDX SBOM generation / CycloneDX SBOM生成
-- **[zenity](https://github.com/ncruces/zenity)** - Cross-platform GUI dialogs / 跨平台GUI对话框
-- **[excelize](https://github.com/xuri/excelize/v2)** - Excel file operations / Excel文件操作
-- **[golang.org/x/mod](https://golang.org/x/mod)** - Go module parsing / Go模块解析
-- **[toml](https://github.com/BurntSushi/toml)** - TOML file parsing for Python projects / TOML文件解析（用于Python项目）
+```bash
+task build  # 产出 license.exe（GOOS=windows，CGO_ENABLED=0，-ldflags="-s -w -H=windowsgui"）
+```
 
-## Technical Details 技术细节
+普通构建：
 
-### Data Sources 数据源
-- **Go modules**: pkg.go.dev v1 API (`/v1/module/` + `/v1/package/`)
-- **Node.js packages**: https://registry.npmjs.org/
-- **Python packages**: https://pypi.org/
+```bash
+go build .
+```
 
-### Error Handling 错误处理
-- Network requests use context with 10-second timeout
-- 网络请求使用带有10秒超时的上下文
-- Graceful handling of missing metadata
-- 优雅处理缺失的元数据
-- User-friendly error messages with zenity dialogs
-- 使用zenity对话框显示用户友好的错误消息
+对话框基于 [zenity](https://github.com/ncruces/zenity)：Windows 无额外依赖，Linux 需要 GTK3，macOS 使用系统原生对话框。
 
-### License URL Generation 许可证URL生成
-The tool generates SPDX license URLs: https://spdx.org/licenses/{SPDX_ID}
-含空格或其他非法字符的 License 标识无法映射到稳定引用，对应 URL 留空。
-工具使用以下格式生成许可证URL：https://spdx.org/licenses/{SPDX标识}
+## 技术细节
 
-## Project Evolution 项目演进
+- **数据源**
+  - Go 模块：pkg.go.dev v1 API（`/v1/module/` 取许可证与仓库，`/v1/package/` 取简介）
+  - Node.js：`https://registry.npmjs.org/{name}/{version}`
+  - Python：`https://pypi.org/pypi/{name}/json`
+- **并发**：8 个 worker 的信号量池；进度更新加锁串行化；结果按索引回填，保证输出顺序稳定
+- **超时**：每个 HTTP 请求独立 10s context；Go 模块端点冷缓存可能返回空 licenses，自动重试一次（404 视为内部包，不重试）
+- **错误处理**：元数据缺失时保留该行并填充已获取字段；取消文件选择时静默退出
 
-该项目经过多次重构和优化：
-- 改进了依赖信息获取逻辑
-- 优化了错误处理和取消逻辑
-- 支持多种项目类型（Go 和 npm）
-- 提供更丰富的输出格式和字段
-- 添加了图形用户界面支持
+## 依赖库
+
+- [cyclonedx-go](https://github.com/CycloneDX/cyclonedx-go) —— CycloneDX SBOM 生成
+- [zenity](https://github.com/ncruces/zenity) —— 跨平台 GUI 对话框
+- [excelize](https://github.com/xuri/excelize/v2) —— Excel 文件操作
+- [golang.org/x/mod](https://pkg.go.dev/golang.org/x/mod) —— go.mod 解析
+- [toml](https://github.com/BurntSushi/toml) —— TOML 解析（用于 pyproject.toml）
+
+## License 许可证
+
+[MIT](LICENSE)
 
 ## Author 作者
 
-License Tool / 许可证工具
+Jia Sui (jsfaint@gmail.com)
