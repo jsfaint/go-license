@@ -55,6 +55,11 @@ The tool will automatically detect each file's type and process accordingly.
   （`pkg:golang/...`、`pkg:npm/...`、`pkg:pypi/...`）、SPDX License ID + URL、Description、Author
 - 跨文件重复依赖按 PURL 去重，`dependencies` 字段留空
 
+### Internal packages 内部包过滤:
+在公开 registry（pkg.go.dev / registry.npmjs.org / pypi.org）上查询不到（404）的依赖，
+视为内部库或不可解析名称，**不会出现在 Excel 报告和 SBOM 中**。运行结束时提示被排除的数量。
+网络错误、超时等不判定为内部库。
+
 ## Requirements 环境要求
 
 - Go 1.25.0 or higher / Go 1.25.0 或更高版本

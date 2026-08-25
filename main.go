@@ -175,6 +175,9 @@ type PackageInfo struct {
 	RepositoryType  string
 	Repository      string
 	ModuleNameNoVer string
+	// Internal marks packages the public registry does not serve (404).
+	// They are excluded from both the Excel report and the SBOM.
+	Internal bool
 }
 
 // Package represents a dependency
@@ -377,10 +380,19 @@ func getPyPI_Metadata(pkg *Package) PackageInfo {
 	}
 
 	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != 200 {
+	if err != nil {
 		return info
 	}
 	defer resp.Body.Close()
+	// A 404 means the package is not on the public registry (internal library
+	// or unresolvable name); other errors keep the row with partial data.
+	if resp.StatusCode == 404 {
+		info.Internal = true
+		return info
+	}
+	if resp.StatusCode != 200 {
+		return info
+	}
 
 	var pypiPkg struct {
 		Info struct {
@@ -511,16 +523,28 @@ func getGoModMetadata(pkg *Package) PackageInfo {
 	}
 	// pkg.go.dev occasionally returns an empty licenses list from a cold
 	// cache; one retry is cheap and avoids a missing license in the report.
+	// A 404 (module not in the public index) is authoritative: mark internal
+	// and stop, without retrying.
 	for attempt := 0; attempt < 2; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		req, err := http.NewRequestWithContext(ctx, "GET", moduleURL, nil)
 		if err == nil {
-			if resp, err := client.Do(req); err == nil && resp.StatusCode == 200 {
-				err = json.NewDecoder(resp.Body).Decode(&mod)
-				resp.Body.Close()
-				if err == nil && len(mod.Licenses) > 0 {
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == 404 {
+					resp.Body.Close()
 					cancel()
-					break
+					info.Internal = true
+					return info
+				}
+				if resp.StatusCode == 200 {
+					err = json.NewDecoder(resp.Body).Decode(&mod)
+					resp.Body.Close()
+					if err == nil && len(mod.Licenses) > 0 {
+						cancel()
+						break
+					}
+				} else {
+					resp.Body.Close()
 				}
 			}
 		}
@@ -627,89 +651,100 @@ func getNPMMetadata(pkg *Package) PackageInfo {
 	}
 
 	resp, err := client.Do(req)
-	if err == nil && resp.StatusCode == 200 {
-		defer resp.Body.Close()
-		var npmPkg struct {
-			License  string `json:"license"`
-			Version  string `json:"version"`
-			Licenses []struct {
-				Type string `json:"type"`
-			} `json:"licenses"`
-			Author      any                 `json:"author"`
-			Maintainers []map[string]string `json:"maintainers"`
-			Description string              `json:"description"`
-			Repository  struct {
-				Type string `json:"type"`
-				URL  string `json:"url"`
-			} `json:"repository"`
-			Homepage string `json:"homepage"`
-			Readme   string `json:"readme"`
+	if err != nil {
+		return info
+	}
+	defer resp.Body.Close()
+	// 404 = package absent from the public registry (internal library)
+	if resp.StatusCode == 404 {
+		info.Internal = true
+		return info
+	}
+	if resp.StatusCode != 200 {
+		return info
+	}
+
+	var npmPkg struct {
+		License  string `json:"license"`
+		Version  string `json:"version"`
+		Licenses []struct {
+			Type string `json:"type"`
+		} `json:"licenses"`
+		Author      any                 `json:"author"`
+		Maintainers []map[string]string `json:"maintainers"`
+		Description string              `json:"description"`
+		Repository  struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"repository"`
+		Homepage string `json:"homepage"`
+		Readme   string `json:"readme"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&npmPkg); err != nil {
+		return info
+	}
+	// Get license
+	if npmPkg.License != "" {
+		info.License = npmPkg.License
+		info.LicenseURL = buildLicenseURL(npmPkg.License)
+	} else if len(npmPkg.Licenses) > 0 {
+		info.License = npmPkg.Licenses[0].Type
+		info.LicenseURL = buildLicenseURL(npmPkg.Licenses[0].Type)
+	}
+
+	// Get author - npm metadata shapes vary; never panic on unexpected types
+	switch a := npmPkg.Author.(type) {
+	case map[string]any:
+		if name, ok := a["name"].(string); ok && name != "" {
+			info.Author = name
+		} else if email, ok := a["email"].(string); ok && email != "" {
+			info.Author = email
 		}
+	case string:
+		if a != "" {
+			info.Author = a
+		}
+	}
 
-		if err := json.NewDecoder(resp.Body).Decode(&npmPkg); err == nil {
-			// Get license
-			if npmPkg.License != "" {
-				info.License = npmPkg.License
-				info.LicenseURL = buildLicenseURL(npmPkg.License)
-			} else if len(npmPkg.Licenses) > 0 {
-				info.License = npmPkg.Licenses[0].Type
-				info.LicenseURL = buildLicenseURL(npmPkg.Licenses[0].Type)
-			}
+	// If no author from main field, try maintainers
+	if info.Author == "" && len(npmPkg.Maintainers) > 0 {
+		if name, ok := npmPkg.Maintainers[0]["name"]; ok {
+			info.Author = name
+		} else if email, ok := npmPkg.Maintainers[0]["email"]; ok {
+			info.Author = email
+		}
+	}
 
-			// Get author - npm metadata shapes vary; never panic on unexpected types
-			switch a := npmPkg.Author.(type) {
-			case map[string]any:
-				if name, ok := a["name"].(string); ok && name != "" {
-					info.Author = name
-				} else if email, ok := a["email"].(string); ok && email != "" {
-					info.Author = email
-				}
-			case string:
-				if a != "" {
-					info.Author = a
-				}
-			}
+	// Resolve the actual version when the manifest spec was not an
+	// exact release: "*", "latest", "", "^x.y.z", "~x.y.z" and dist
+	// tags all resolve to the concrete version the registry served.
+	// For an exact pin the registry echoes the same version back.
+	if npmPkg.Version != "" && npmPkg.Version != info.Version {
+		info.Version = npmPkg.Version
+	}
 
-			// If no author from main field, try maintainers
-			if info.Author == "" && len(npmPkg.Maintainers) > 0 {
-				if name, ok := npmPkg.Maintainers[0]["name"]; ok {
-					info.Author = name
-				} else if email, ok := npmPkg.Maintainers[0]["email"]; ok {
-					info.Author = email
-				}
-			}
+	info.Description = npmPkg.Description
 
-			// Resolve the actual version when the manifest spec was not an
-			// exact release: "*", "latest", "", "^x.y.z", "~x.y.z" and dist
-			// tags all resolve to the concrete version the registry served.
-			// For an exact pin the registry echoes the same version back.
-			if npmPkg.Version != "" && npmPkg.Version != info.Version {
-				info.Version = npmPkg.Version
-			}
+	// Get repository/GitHub URL
+	if npmPkg.Repository.URL != "" {
+		info.Repository = npmPkg.Repository.URL
+		info.GitHubURL = npmPkg.Repository.URL
+	} else if npmPkg.Homepage != "" {
+		info.Repository = npmPkg.Homepage
+	}
 
-			info.Description = npmPkg.Description
+	// Set copyright from license
+	info.Copyright = setCopyrightFromLicense(info.License)
 
-			// Get repository/GitHub URL
-			if npmPkg.Repository.URL != "" {
-				info.Repository = npmPkg.Repository.URL
-				info.GitHubURL = npmPkg.Repository.URL
-			} else if npmPkg.Homepage != "" {
-				info.Repository = npmPkg.Homepage
-			}
-
-			// Set copyright from license
-			info.Copyright = setCopyrightFromLicense(info.License)
-
-			// If no license found, try to extract from README
-			if info.License == "" && npmPkg.Readme != "" {
-				// Try to find copyright mentions in README
-				for line := range strings.SplitSeq(npmPkg.Readme, "\n") {
-					if strings.Contains(strings.ToLower(line), "copyright") ||
-						strings.Contains(line, "©") {
-						info.Copyright = strings.TrimSpace(line)
-						break
-					}
-				}
+	// If no license found, try to extract from README
+	if info.License == "" && npmPkg.Readme != "" {
+		// Try to find copyright mentions in README
+		for line := range strings.SplitSeq(npmPkg.Readme, "\n") {
+			if strings.Contains(strings.ToLower(line), "copyright") ||
+				strings.Contains(line, "©") {
+				info.Copyright = strings.TrimSpace(line)
+				break
 			}
 		}
 	}
@@ -908,6 +943,7 @@ func main() {
 	}
 	var rows []excelRow
 	var modules []moduleResult
+	excluded := 0
 	for _, pf := range parsed {
 		infos := make([]PackageInfo, 0, len(pf.packages))
 		for _, pkg := range pf.packages {
@@ -924,6 +960,12 @@ func main() {
 				info = getPyPI_Metadata(&pkg)
 			} else {
 				info = getNPMMetadata(&pkg)
+			}
+			// Internal/unresolvable packages (registry 404) are dropped
+			// from both the Excel report and the SBOM.
+			if info.Internal {
+				excluded++
+				continue
 			}
 			infos = append(infos, info)
 			rows = append(rows, excelRow{sourceFile: filepath.Base(pf.inName), info: info})
@@ -958,7 +1000,7 @@ func main() {
 			f.SetCellValue(sheetName, cell, val)
 		}
 	}
-	if err := f.SaveAs("license_report.xlsx"); err != nil {
+	if err := f.SaveAs("sbom_report.xlsx"); err != nil {
 		zenity.Error("Failed to save Excel file: "+err.Error(), zenity.Title("Error"), zenity.ErrorIcon)
 		return
 	}
@@ -979,5 +1021,9 @@ func main() {
 	}
 
 	dlg.Complete()
-	zenity.Info("License report: license_report.xlsx. SBOM: sbom.json", zenity.Title("Success"), zenity.InfoIcon)
+	msg := "License report: sbom_report.xlsx. SBOM: sbom.json"
+	if excluded > 0 {
+		msg += fmt.Sprintf("\nExcluded %d internal/unresolvable package(s) (not on public registries).", excluded)
+	}
+	zenity.Info(msg, zenity.Title("Success"), zenity.InfoIcon)
 }
