@@ -360,7 +360,7 @@ func parsePyProjectToml(filename string) ([]Package, string, error) {
 }
 
 // Get metadata from PyPI
-func getPyPI_Metadata(pkg *Package) PackageInfo {
+func getPyPI_Metadata(ctx context.Context, pkg *Package) PackageInfo {
 	info := PackageInfo{
 		Name:            pkg.Path,
 		Version:         pkg.Version,
@@ -375,7 +375,7 @@ func getPyPI_Metadata(pkg *Package) PackageInfo {
 	client := createHTTPClient()
 
 	// Get info from PyPI API with context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// First try to get package info
@@ -499,7 +499,7 @@ func getPyPI_Metadata(pkg *Package) PackageInfo {
 // getGoModMetadata fetches module metadata from the official pkg.go.dev v1 API
 // (https://pkg.go.dev/v1/module/{path}) instead of scraping HTML, which was
 // fragile against frontend changes.
-func getGoModMetadata(pkg *Package) PackageInfo {
+func getGoModMetadata(ctx context.Context, pkg *Package) PackageInfo {
 	info := PackageInfo{
 		Name:           pkg.Path,
 		Version:        pkg.Version,
@@ -532,7 +532,7 @@ func getGoModMetadata(pkg *Package) PackageInfo {
 	// A 404 (module not in the public index) is authoritative: mark internal
 	// and stop, without retrying.
 	for attempt := 0; attempt < 2; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		req, err := http.NewRequestWithContext(ctx, "GET", moduleURL, nil)
 		if err == nil {
 			if resp, err := client.Do(req); err == nil {
@@ -594,7 +594,7 @@ func getGoModMetadata(pkg *Package) PackageInfo {
 		pkgURL += "?version=" + url.QueryEscape(version)
 	}
 	{
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		req2, err := http.NewRequestWithContext(ctx, "GET", pkgURL, nil)
 		if err == nil {
@@ -628,7 +628,7 @@ func getGoModMetadata(pkg *Package) PackageInfo {
 }
 
 // Get metadata from npm registry
-func getNPMMetadata(pkg *Package) PackageInfo {
+func getNPMMetadata(ctx context.Context, pkg *Package) PackageInfo {
 	info := PackageInfo{
 		Name:            pkg.Path,
 		Version:         pkg.Version,
@@ -647,7 +647,7 @@ func getNPMMetadata(pkg *Package) PackageInfo {
 	client := createHTTPClient()
 
 	// Get info from npm registry with context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	regURL := "https://registry.npmjs.org/" + pkg.Path + "/" + version
@@ -939,13 +939,28 @@ func main() {
 		mainName = strings.TrimSuffix(mainName, "+")
 	}
 
+	// A cancellable context drives both the progress dialog and the metadata
+	// fetches: closing the dialog (Cancel button / window X) cancels the
+	// context, which aborts in-flight HTTP requests and stops the workers.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	dlg, err := zenity.Progress(
-		zenity.Title("Running..."))
+		zenity.Title("Running..."),
+		zenity.Context(ctx))
 	if err != nil {
 		zenity.Error("Create progress dialog failed: "+err.Error(), zenity.Title("Error"), zenity.ErrorIcon)
 		os.Exit(1)
 	}
 	defer dlg.Close()
+
+	// The dialog's Done channel closes when the user cancels. A goroutine
+	// watches it and cancels the context; the workers see the cancellation
+	// and stop, and wg.Wait() below returns.
+	go func() {
+		<-dlg.Done()
+		cancel()
+	}()
 
 	total := 0
 	for _, pf := range parsed {
@@ -987,13 +1002,19 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			// Stop fetching once the user cancels the dialog; the context
+			// also aborts any in-flight HTTP requests.
+			if ctx.Err() != nil {
+				return
+			}
+
 			var info PackageInfo
 			if j.pf.isGoMod {
-				info = getGoModMetadata(&j.pkg)
+				info = getGoModMetadata(ctx, &j.pkg)
 			} else if j.pf.isPyProject {
-				info = getPyPI_Metadata(&j.pkg)
+				info = getPyPI_Metadata(ctx, &j.pkg)
 			} else {
-				info = getNPMMetadata(&j.pkg)
+				info = getNPMMetadata(ctx, &j.pkg)
 			}
 			results[j.fi][j.idx] = info
 
@@ -1007,6 +1028,14 @@ func main() {
 		}(j)
 	}
 	wg.Wait()
+
+	// The user cancelled the progress dialog: stop before writing any output
+	// and exit after a confirmation prompt.
+	if ctx.Err() != nil {
+		dlg.Close()
+		zenity.Info("Analysis cancelled. No report was generated.", zenity.Title("Cancelled"), zenity.InfoIcon)
+		os.Exit(0)
+	}
 
 	// Collect in manifest order; internal/unresolvable packages (registry
 	// 404) are dropped from both the Excel report and the SBOM.
