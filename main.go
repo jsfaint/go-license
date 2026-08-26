@@ -797,16 +797,12 @@ type moduleResult struct {
 // Scope is limited to top-level (direct) dependencies per the CRA minimum
 // requirement; transitive dependencies would need lockfile parsing.
 // Duplicate packages across modules are merged by PURL.
-func buildSBOM(modules []moduleResult) *cyclonedx.BOM {
+// mainName is the project name recorded in the BOM metadata; callers fall
+// back to the module names joined with "+" when the user leaves it empty.
+func buildSBOM(modules []moduleResult, mainName string) *cyclonedx.BOM {
 	bom := cyclonedx.NewBOM()
 	bom.SpecVersion = cyclonedx.SpecVersion1_6
 	bom.JSONSchema = "http://cyclonedx.org/schema/bom-1.6.schema.json"
-
-	var mainName string
-	for _, m := range modules {
-		mainName += m.moduleName + "+"
-	}
-	mainName = strings.TrimSuffix(mainName, "+")
 
 	bom.Metadata = &cyclonedx.Metadata{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -925,6 +921,22 @@ func main() {
 			isPyProject: isPyProject,
 			packages:    packages,
 		})
+	}
+
+	// Ask the user for the project name used in the SBOM metadata. Leaving it
+	// empty falls back to the module names joined with "+".
+	mainName, err := zenity.Entry("Project name for the SBOM (leave empty to use module names)",
+		zenity.Title("Project name"))
+	if err != nil {
+		// User cancelled - exit process instead of showing error dialog
+		os.Exit(1)
+	}
+	mainName = strings.TrimSpace(mainName)
+	if mainName == "" {
+		for _, pf := range parsed {
+			mainName += pf.moduleName + "+"
+		}
+		mainName = strings.TrimSuffix(mainName, "+")
 	}
 
 	dlg, err := zenity.Progress(
@@ -1046,7 +1058,7 @@ func main() {
 	}
 
 	// Assemble the merged CycloneDX SBOM covering all selected manifests
-	bom := buildSBOM(modules)
+	bom := buildSBOM(modules, mainName)
 	sbomOut, err := os.Create("sbom.json")
 	if err != nil {
 		zenity.Error("Failed to create SBOM file: "+err.Error(), zenity.Title("Error"), zenity.ErrorIcon)
